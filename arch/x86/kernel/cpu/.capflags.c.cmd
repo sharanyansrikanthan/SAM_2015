@@ -1,0 +1,1 @@
+cmd_arch/x86/kernel/cpu/capflags.c := /bin/sh /localdisk/srikanth/rpmbuild/BUILD/kernel-3.14.fc19.new/ATC/for_release/arch/x86/kernel/cpu/mkcapflags.sh arch/x86/kernel/cpu/../../include/asm/cpufeature.h arch/x86/kernel/cpu/capflags.c

@@ -1,0 +1,6 @@
+config CONFIG_SAM_DEBUG
+	def_bool y
+
+config CONFIG_SAM_PRINTS
+	def_bool y
+

@@ -1,0 +1,36 @@
+For the usual compilation and installation instructions, refer to the README.
+
+This file talks about the specific parameters needed to be initialized for SAM.
+These parameters are obtained by offline characterization of the underlying hardware platform.
+
+All these parameters are present in kernel/sched/core.h
+Details on these parameters is explained in this file. Information on setting
+thresholds is explained in the paper: 
+Sharanyan Srikanthan, Sandhya Dwarkadas, and Kai Shen, "Data Sharing or Resource Contention: Toward Performance Transparency on Multicore Systems", In Proc. of the USENIX Annual Technical Conference, Santa Clara, CA, July 2015
+
+These are following are architecture specific MSRs. They do not have to changed for
+IvyBridge, SandyBridge, Haswell, Broadwell, etc. Please do refer to the architectural manual for any future changes. 
+#define IA32_FIXED_CTR_CTRL 0x38D
+#define IA32_PERF_GLOBAL_CTRL 0x38F
+#define PERF_FIXED_CTR0 0x309
+#define PERF_FIXED_CTR1 0x30A
+#define PERF_FIXED_CTR2 0x30B
+#define PerfEvtSel0 0x186
+#define PerfEvtSel1 0x187
+#define PerfEvtSel2 0x188
+#define PerfEvtSel3 0x189
+#define IA32_PMC0 0xC1
+#define IA32_PMC1 0xC2
+#define IA32_PMC2 0xC3
+#define IA32_PMC3 0xC4
+#define OFFCORE_RSP_0 0x1A6
+
+The following are machine dependent parameters that are to be set for every machine:
+#define MAX_SHAR_NUM_SOCKETS 2 // The number of sockets
+#define MAX_SHAR_PROCESSORS_CORE 20 // Number of logical cores in a socket           
+int SHAR_MEM_THRESH = 75000000;   // LLC_MISSES threshold as described in the paper
+int SHAR_COHERENCE_THRESH = 550000; // Inter-socket coherence activity threshold as described in paper
+#define SHAR_REMOTE_THRESH 2700000  // Similar threshold for remote memory accesses 
+#define SHAR_CYCLES 2200000000.0    // Number of cycles max CPU cycles in a second
+
+The above values can be changed dynamically, if required, to control the experiments as needed. 
