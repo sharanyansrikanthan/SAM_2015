@@ -21,3 +21,6 @@ There are 2 pairs of threads, each pair that communicates with its
 paired thread. Linux by default schedules them on different sockets
 creating coherence traffic. Used to determine SAM thresholds as discussed
 in the paper.
+
+For reading performance counter values without SAM suggestion tools are: 
+linux perf or perfmon.
