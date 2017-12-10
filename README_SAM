@@ -33,4 +33,6 @@ int SHAR_COHERENCE_THRESH = 550000; // Inter-socket coherence activity threshold
 #define SHAR_REMOTE_THRESH 2700000  // Similar threshold for remote memory accesses 
 #define SHAR_CYCLES 2200000000.0    // Number of cycles max CPU cycles in a second
 
-The above values can be changed dynamically, if required, to control the experiments as needed. 
+The above values can be changed dynamically, if required, to control the experiments as needed.
+
+Refer util/ for initializing and deploying SAM on Linux

@@ -3,7 +3,6 @@
  *
  *  Kernel scheduler and related syscalls
  * 
- *   *
  *  Copyright (C) 1991-2002  Linus Torvalds
  *
  *  1996-12-23  Modified by Dave Grothe to fix bugs in semaphores and
@@ -27,6 +26,7 @@
  *              Thomas Gleixner, Mike Kravetz
  *  2016-12-21  Sharing Aware Mapper (SAM) code additions.
  *  Contributors: Sharanyan Srikanthan, Sandhya Dwarkadas, and Kai Shen 
+ *  University of Rochester
  *  Check https://www.cs.rochester.edu/u/srikanth/Publications/atc16_paper-srikanthan.pdf
  */
 

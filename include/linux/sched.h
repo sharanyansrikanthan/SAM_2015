@@ -1,14 +1,10 @@
 /*
  *  sched.h
  *
- *  General Linux scheduler header file edited with data structures 
- *  that support the SAM scheduler
- *
- *
- *  2016-12-21  Sharing Aware Mapper (SAM) code additions.
+ *  2016-12-21  Sharing Aware Mapper (SAM) data structures to assist scheduling.
  *  Contributors: Sharanyan Srikanthan, Sandhya Dwarkadas, and Kai Shen
  *  University of Rochester
- *
+ *  Check https://www.cs.rochester.edu/u/srikanth/Publications/atc16_paper-srikanthan.pdf
  */
 
 #ifndef _LINUX_SCHED_H
@@ -1174,35 +1170,40 @@ enum perf_event_task_context {
 	perf_nr_task_contexts,
 };
 
+// SAM addition: Variables to store hardware
+// performance counters
 struct perf_collection {
-        long temp;
-        long llc_l3hit;
-        long llc_l3miss;
-        long llc_l2miss;
-        long llc_remotefwd;
-        long llc_remotehitm;
-        long llc_misses;
+    long temp;
+    long llc_l3hit;
+    long llc_l3miss;
+    long llc_l2miss;
+    long llc_remotefwd;
+    long llc_remotehitm;
+    long llc_misses;
 	long llc_prefetch;
-        long unhalted;
+    long unhalted;
 	long unhalted1;
 	long unhalted2;
-        long inst;
-        long cycles;
+    long inst;
+    long cycles;
 	long remote_dram;
 };
+
+// SAM addition: Variables to log hardware
+// performance counter metrics
 struct perf_collection_log {
-        long llc_l3hit;
-        long llc_l3miss;
-        long llc_l2miss;
-        long llc_remotefwd;
-        long llc_remotehitm;
-        long llc_misses;
+    long llc_l3hit;
+    long llc_l3miss;
+    long llc_l2miss;
+    long llc_remotefwd;
+    long llc_remotehitm;
+    long llc_misses;
 	long llc_prefetch;
-        long unhalted1;
+    long unhalted1;
 	long unhalted2;
 	long unhalted;
-        long inst;
-        long cycles;
+    long inst;
+    long cycles;
 	long remote_dram;
 	int collections;
 	long tot_snp;
@@ -1216,17 +1217,18 @@ struct perf_collection_log {
 };
 
 struct task_struct {
-        // shar
-        int collect_round;
-        volatile long state;    /* -1 unrunnable, 0 runnable, >0 stopped */
-        void *stack;
-        atomic_t usage;
-        unsigned int flags;     /* per process flags, defined below */
-        unsigned int ptrace;
-        int round_collection;
+    volatile long state;    /* -1 unrunnable, 0 runnable, >0 stopped */
+    void *stack;
+    atomic_t usage;
+    unsigned int flags;     /* per process flags, defined below */
+    unsigned int ptrace;
+
+    // SAM performance counter collection state
+    int round_collection;
+    int collect_round;
 	int remote_mig;
-        int collection_active;
-        struct perf_collection temp, sure;
+    int collection_active;
+    struct perf_collection temp, sure;
 	struct perf_collection_log log;
 
 #ifdef CONFIG_SMP

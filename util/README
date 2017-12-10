@@ -1,0 +1,23 @@
+init.c: Initializes SAM 
+Usage: ./init <PID>
+Example: ./init 1000
+
+PID specified with init is to restrict SAM from operating on some threads.
+SAM will not move/control tasks whose PID is less than the specified PID. 
+Value of 1000 prevents SAM from moving special purpose threads spawned 
+when Linux is launched on the machine it was developed. 
+
+A good value can be obtained by typing "ps" in the shell after Linux boots. 
+
+deploy.c: Activates SAM scheduling
+Usage: ./deploy <scheduling interval in milliseconds>
+Example: sudo ./deploy 100 
+
+100ms interval works well and is discussed in the paper
+
+HuBench.c: Microbenchmark to create coherence traffic
+Creates a 4 threaded microbenchmark to create coherence traffic. 
+There are 2 pairs of threads, each pair that communicates with its
+paired thread. Linux by default schedules them on different sockets
+creating coherence traffic. Used to determine SAM thresholds as discussed
+in the paper.
