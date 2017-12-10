@@ -1,1 +1,0 @@
-cmd_drivers/thermal/x86_pkg_temp_thermal.ko := ld -r -m elf_x86_64 -T /localdisk/srikanth/rpmbuild/BUILD/kernel-3.14.fc19.new/ATC/for_release/scripts/module-common.lds --build-id  -o drivers/thermal/x86_pkg_temp_thermal.ko drivers/thermal/x86_pkg_temp_thermal.o drivers/thermal/x86_pkg_temp_thermal.mod.o

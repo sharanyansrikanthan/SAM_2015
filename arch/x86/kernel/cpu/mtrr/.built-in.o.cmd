@@ -1,1 +1,0 @@
-cmd_arch/x86/kernel/cpu/mtrr/built-in.o :=  ld -m elf_x86_64   -r -o arch/x86/kernel/cpu/mtrr/built-in.o arch/x86/kernel/cpu/mtrr/main.o arch/x86/kernel/cpu/mtrr/if.o arch/x86/kernel/cpu/mtrr/generic.o arch/x86/kernel/cpu/mtrr/cleanup.o 
