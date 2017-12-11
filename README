@@ -3,7 +3,10 @@ at srikanth@cs.rochester.edu
 
 Paper link: https://www.cs.rochester.edu/u/srikanth/Publications/atc16_paper-srikanthan.pdf 
 
-Linux kernel release 3.x <http://kernel.org/>
+A patch for SAM can be found in util/SAM_Patch
+Use patch on linux-3.14.8
+
+Linux kernel release 3.14 <http://kernel.org/>
 
 
 These are the release notes for Linux version 3.  Read them carefully,
