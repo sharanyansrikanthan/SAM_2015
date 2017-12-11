@@ -35,4 +35,4 @@ int SHAR_COHERENCE_THRESH = 550000; // Inter-socket coherence activity threshold
 
 The above values can be changed dynamically, if required, to control the experiments as needed.
 
-Refer util/ for initializing and deploying SAM on Linux
+Use util/ for patching, initializing and deploying SAM on Linux
