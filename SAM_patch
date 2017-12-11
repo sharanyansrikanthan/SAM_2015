@@ -1,0 +1,1663 @@
+diff -ruN vanilla-3.14/include/linux/sched.h SAM_2015/include/linux/sched.h
+--- vanilla-3.14/include/linux/sched.h	2014-03-30 23:40:15.000000000 -0400
++++ SAM_2015/include/linux/sched.h	2017-12-10 21:39:02.980088333 -0500
+@@ -1,3 +1,12 @@
++/*
++ *  sched.h
++ *
++ *  2016-12-21  Sharing Aware Mapper (SAM) data structures to assist scheduling.
++ *  Contributors: Sharanyan Srikanthan, Sandhya Dwarkadas, and Kai Shen
++ *  University of Rochester
++ *  Check https://www.cs.rochester.edu/u/srikanth/Publications/atc16_paper-srikanthan.pdf
++ */
++
+ #ifndef _LINUX_SCHED_H
+ #define _LINUX_SCHED_H
+ 
+@@ -1161,12 +1170,66 @@
+ 	perf_nr_task_contexts,
+ };
+ 
++// SAM addition: Variables to store hardware
++// performance counters
++struct perf_collection {
++    long temp;
++    long llc_l3hit;
++    long llc_l3miss;
++    long llc_l2miss;
++    long llc_remotefwd;
++    long llc_remotehitm;
++    long llc_misses;
++	long llc_prefetch;
++    long unhalted;
++	long unhalted1;
++	long unhalted2;
++    long inst;
++    long cycles;
++	long remote_dram;
++};
++
++// SAM addition: Variables to log hardware
++// performance counter metrics
++struct perf_collection_log {
++    long llc_l3hit;
++    long llc_l3miss;
++    long llc_l2miss;
++    long llc_remotefwd;
++    long llc_remotehitm;
++    long llc_misses;
++	long llc_prefetch;
++    long unhalted1;
++	long unhalted2;
++	long unhalted;
++    long inst;
++    long cycles;
++	long remote_dram;
++	int collections;
++	long tot_snp;
++	long tot_mem;
++	long tot_coh;
++	long tot_rdram;
++	int prob_snp;
++	int prob_mem;
++	int prob_coh;
++	int prob_rdram;
++};
++
+ struct task_struct {
+-	volatile long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
+-	void *stack;
+-	atomic_t usage;
+-	unsigned int flags;	/* per process flags, defined below */
+-	unsigned int ptrace;
++    volatile long state;    /* -1 unrunnable, 0 runnable, >0 stopped */
++    void *stack;
++    atomic_t usage;
++    unsigned int flags;     /* per process flags, defined below */
++    unsigned int ptrace;
++
++    // SAM performance counter collection state
++    int round_collection;
++    int collect_round;
++	int remote_mig;
++    int collection_active;
++    struct perf_collection temp, sure;
++	struct perf_collection_log log;
+ 
+ #ifdef CONFIG_SMP
+ 	struct llist_node wake_entry;
+@@ -1688,6 +1751,24 @@
+ }
+ 
+ 
++static int pid_alive(const struct task_struct *p);
++static inline pid_t task_ppid_nr_ns(const struct task_struct *tsk, struct pid_namespace *ns)
++{
++	pid_t pid = 0;
++
++	rcu_read_lock();
++	if (pid_alive(tsk))
++		pid = task_tgid_nr_ns(rcu_dereference(tsk->real_parent), ns);
++	rcu_read_unlock();
++
++	return pid;
++}
++
++static inline pid_t task_ppid_nr(const struct task_struct *tsk)
++{
++	return task_ppid_nr_ns(tsk, &init_pid_ns);
++}
++
+ static inline pid_t task_pgrp_nr_ns(struct task_struct *tsk,
+ 					struct pid_namespace *ns)
+ {
+@@ -1727,7 +1808,7 @@
+  *
+  * Return: 1 if the process is alive. 0 otherwise.
+  */
+-static inline int pid_alive(struct task_struct *p)
++static inline int pid_alive(const struct task_struct *p)
+ {
+ 	return p->pids[PIDTYPE_PID].pid != NULL;
+ }
+diff -ruN vanilla-3.14/kernel/sched/core.c SAM_2015/kernel/sched/core.c
+--- vanilla-3.14/kernel/sched/core.c	2014-03-30 23:40:15.000000000 -0400
++++ SAM_2015/kernel/sched/core.c	2017-12-10 21:38:41.976691041 -0500
+@@ -2,7 +2,7 @@
+  *  kernel/sched/core.c
+  *
+  *  Kernel scheduler and related syscalls
+- *
++ * 
+  *  Copyright (C) 1991-2002  Linus Torvalds
+  *
+  *  1996-12-23  Modified by Dave Grothe to fix bugs in semaphores and
+@@ -24,6 +24,10 @@
+  *  2007-07-01  Group scheduling enhancements by Srivatsa Vaddagiri
+  *  2007-11-29  RT balancing improvements by Steven Rostedt, Gregory Haskins,
+  *              Thomas Gleixner, Mike Kravetz
++ *  2016-12-21  Sharing Aware Mapper (SAM) code additions.
++ *  Contributors: Sharanyan Srikanthan, Sandhya Dwarkadas, and Kai Shen 
++ *  University of Rochester
++ *  Check https://www.cs.rochester.edu/u/srikanth/Publications/atc16_paper-srikanthan.pdf
+  */
+ 
+ #include <linux/mm.h>
+@@ -88,6 +92,943 @@
+ 
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/sched.h>
++#include "core.h"
++
++static int reset_measure(const int snum);
++
++/* SAM Addition
++ * Not used unless required for understanding inner working of SAM
++ * Print detailed performance counter information per socket. 
++ * cpu: Core on which it is running. Does not have to be accurate. Is provided here just to
++ * help reason with the print. 
++ * tsk: Pointer to the task struct of the task */
++void print_task_collection(struct task_struct *tsk, int cpu)
++{
++        printk(" %d CPU \n Instructions : %lu \n Cycles %lu \n Unhalted Ref %lu \n REMOTE DRAM %lu \n LLC MISSES L3hit %lu \n LLC MISSES L2miss %lu \n LLC MISSES L3miss %lu \n LLC REMOTE FWD %lu \n LLC REMOTE HITM %lu \n LLC MISSES %lu \n LLC PREFETCH %lu \n ROUND COLLECTION %d COLLECTION ACTIVE %d ID %d \n UNHALTED1 %ld UNHALTED2 %ld \n ",cpu, tsk->sure.inst, tsk->sure.cycles, tsk->sure.unhalted, tsk->sure.remote_dram, tsk->sure.llc_l3hit, tsk->sure.llc_l2miss, tsk->sure.llc_l3miss, tsk->sure.llc_remotefwd, tsk->sure.llc_remotehitm, tsk->sure.llc_misses, tsk->sure.llc_prefetch, tsk->round_collection, tsk->collection_active,tsk->pid,tsk->sure.unhalted1,tsk->sure.unhalted2);
++        return;
++}
++
++/* SAM Addition
++ * Not used unless required for understanding inner working of SAM
++ * Prints the accumulated performance counter values during the lifetime of the task. Debugging purposes only 
++ * tsk: Pointer to the task struct of the task
++ * cpu: Core on which the task is to be run. Optional - For better reasoning with task migrations. */
++void print_task_log(struct task_struct *tsk, int cpu)
++{
++        printk(" %d CPU \n Name: %s \n Instructions : %lu \n Cycles %lu \n Unhalted Ref %lu \n REMOTE DRAM %lu \n LLC MISSES L3hit %lu \n LLC MISSES L2miss %lu \n LLC MISSES L3miss %lu \n LLC REMOTE FWD %lu \n LLC REMOTE HITM %lu \n LLC MISSES %lu \n LLC PREFETCH %lu \n NUMBER COLLECTION %d \n UNHALTED1 %ld UNHALTED2 %ld \n TOT COH %ld \n TOT SNP %ld \n TOT MEM %ld \n TOT DRAM %ld \n Prob COH %d \n Prob SNP %d \n Prob MEM %d \n Prob DRAM %d \n  ",cpu, tsk->comm, tsk->log.inst, tsk->log.cycles, tsk->log.unhalted, tsk->log.remote_dram, tsk->log.llc_l3hit, tsk->log.llc_l2miss, tsk->log.llc_l3miss, tsk->log.llc_remotefwd, tsk->log.llc_remotehitm, tsk->log.llc_misses, tsk->log.llc_prefetch, tsk->log.collections,tsk->log.unhalted1,tsk->log.unhalted2,tsk->log.tot_coh,tsk->log.tot_snp,tsk->log.tot_mem, tsk->log.tot_rdram,tsk->log.prob_coh,tsk->log.prob_snp,tsk->log.prob_mem,tsk->log.prob_rdram);
++        return;
++}
++
++/* SAM Addition
++ * Not used unless required for understanding inner working of SAM
++ * Print per socket information */
++void print_shar_ps_data(struct shar_per_socket* s)
++{
++	printk(" %d Snum\n Total Memory  %ld \n Total Cross Socket Snoop %ld \n Total Snoop Inside Socket %ld \n Total Active Processes %d \n Total Remote DRAM accessing processes %d \n DNEW %d \n",s->snum, s->tot_mem, s->tot_crosssoc, s->tot_snoopsoc, s->active_processes, s->p_remote, s->dnew);
++	return;
++}
++
++/* SAM Addition
++ * Prepare general masks to move tasks to different sockets. 
++ * i: Socket number */
++void prepare_socket_mask1(int i);
++
++/* SAM Addition
++ * Initial call to setup SAM.
++ * pid: Don't care 
++ * arg0: Task ID for setting shar_id as discussed before
++ * Also enables the SAM */
++asmlinkage long sys_shar_call_test(int arg0, int pid)
++{
++    printk(" Hello World NEW Release !");
++    printk("--syscall arg %d", arg0);
++
++    shar_enable = 1;
++	shar_task = pid;
++	shar_id = arg0;
++
++	if (arg0 == 2)
++        shar_print = 1;
++        if (arg0 == 3)
++            shar_print = 0;
++	printk("calling prepare socket\n");
++	prepare_socket_mask1(0);
++    printk("Printing shar_enable %d\n",shar_enable);
++    return((long) shar_enable);
++}
++
++/* SAM Addition
++ * Function call to read a MSR. 
++ * cpuid: Core on which MSR to be read. 
++ * msr: Actual register to read */
++asmlinkage long sys_shar_rdmsr(int cpuid, int msr)
++{
++	unsigned int low,high;
++	long res;
++	printk("RDMSR for %d %d",cpuid,msr);
++
++	if (rdmsr_on_cpu(cpuid,msr,&low,&high)!=0)
++		return -1;
++	res = (((long)high) << 32) | low;
++	return res;
++}
++/* SAM Addition:
++ * Function call to write a MSR
++ * cpuid: Core on which MSR is to be write
++ * msr: MSR register identifier
++ * value: Value to be written to the MSR */
++asmlinkage long sys_shar_wrmsr(int cpuid, int msr,long value)
++{
++	unsigned int low,high;
++	long res;
++
++	low = (unsigned int) value;
++	high = (unsigned int)(value >> 32);
++	printk("RDMSR for %d %d",cpuid,msr);
++
++	res = (long)wrmsr_on_cpu(cpuid,msr,low,high);
++	
++	return res;
++}
++
++/* SAM Addition:
++ *  Socket mask for generally migrating tasks to different sockets */
++struct cpumask socket_mask[MAX_SHAR_NUM_SOCKETS];
++void prepare_socket_mask1(int ii)
++{
++	int j=0,i;
++	printk("\n Entering PREPARE SOCKET \n");
++	for (i=ii; i<SHAR_NUM_SOCKETS;i++) {
++		cpumask_clear(&socket_mask[i]);
++		printk("Mask set for i %d j %d\n",i,j); 
++		for (j=0;j<SHAR_PROCESSORS_CORE;j++)
++			cpumask_set_cpu((unsigned int)((j*SHAR_NUM_SOCKETS)+i), &socket_mask[i]);
++		printk("\n CPUMask %d is %d",i,*((int*)&socket_mask[i]));
++	}
++	return;
++}
++
++/* SAM Addition
++ * Migrate the task to the assigned cpu. 
++ * cpu: Core to be migrated to
++ * pid: Task PID to be migrated */
++static void move_to_cpu_sys(const int cpu, const int pid)
++{
++	struct cpumask shar_mask;
++	cpumask_clear(&shar_mask);
++	cpumask_set_cpu((unsigned int)cpu, &shar_mask);
++	sched_setaffinity(pid, &shar_mask);
++	sched_setaffinity(pid, &socket_mask[cpu%SHAR_NUM_SOCKETS]);
++	return;
++}
++static void setup_round1(const int cpu);
++
++/* SAM Addition
++ * Major syscall that is used to interact with SAM.
++ * NUM: Selects the type of interaction. data1, data2 may be used 
++ * by those interactions 
++ * num = 1: Enable/Disable SAM. data1 = 1 is enable. data1 = 0 is disable
++ * num = 2: Print performance counter info from a socket. data1 = socket num
++ * num = 3: SAM will only observe bottlenecks. No decision making.
++ * num = 4: Read from MSR
++ * num = 5: Write to MSR
++ * num = 6: Configure performance counters
++ * num = 7: Enable/disable task migrations. data1 should be set or reset
++ * num = 8: SAM normal working mode
++ * num = 9: SAM but no migrations
++ * num = 10: Full system data dump
++ */
++asmlinkage long sys_shar_prog (int num, int data1, int data2)
++{
++	struct task_struct *tsk;
++	struct rq *rq;
++	int cpu = 0, count;
++	long cycles, instructions, unhalted, remote_dram, tot_coh, tot_snp;
++	long tot_mem, prob_coh, prob_snp, prob_mem, prob_dram;
++	
++	/* Enable/Disable SAM. */
++	if (num == 1) {
++		if (data1 == 2)
++			printk(" Shar_ready print %d \n",shar_ready);
++		else
++			shar_enable = data1;
++	}
++	if (num == 2) {
++		cpu = data1;
++		cycles = 0;
++		instructions = 0;
++		unhalted = 0;
++		remote_dram = 0;
++		tot_coh = 0;
++		tot_snp = 0;
++		tot_mem = 0;
++		prob_coh = 0;
++		prob_snp = 0;
++		prob_mem = 0;
++		prob_dram = 0;
++
++		for (count = 0; count < SHAR_PROCESSORS_CORE; count++, 
++			cpu+=SHAR_NUM_SOCKETS) {
++            rq = cpu_rq(cpu);
++	        tsk = rq->curr;
++            shar_print = 0;
++            print_task_collection(tsk,cpu);
++			print_task_log(tsk,cpu);
++			cycles += tsk->log.cycles;
++			instructions += tsk->log.inst;
++			unhalted += tsk->log.unhalted;
++			remote_dram += tsk->log.remote_dram;
++			tot_snp += tsk->log.tot_snp;
++			tot_coh += tsk->log.tot_coh;
++			tot_mem += tsk->log.tot_mem;
++			prob_coh += tsk->log.prob_coh;
++			prob_snp += tsk->log.prob_snp;
++			prob_mem += tsk->log.prob_mem;
++			prob_dram += tsk->log.prob_rdram;
++	    }
++		
++		printk("Shar end and end1 %d and %d \n",shar_end,shar_end1);
++		print_shar_ps_data(&shar_ps_data[data2]);
++		printk("\n Cycles: %ld \n Instructions: %ld \n Unhalted: %ld \n Remote_DRAM: %ld \n TOT_COH: %ld \n TOT_SNP %ld \n TOT_MEM %ld \n Prob_COH %ld \n Prob_SNP %ld \n Prob_MEM %ld \n Prob_RDRAM %ld \n",cycles,instructions, unhalted,remote_dram,tot_coh,tot_snp,tot_mem,prob_coh, prob_snp,prob_mem,prob_dram);
++	}
++	/* Observe bottlenecks only. Don't migrate. */
++	if (num == 3) {
++		cpu = 0;
++		for (cpu = 0; cpu < SHAR_NUM_SOCKETS; cpu++)
++			if(shar_ps_data[cpu].dnew != 2)
++				printk("S Socket %d not ready \n", cpu);
++		for (cpu = 0; cpu < SHAR_NUM_SOCKETS; cpu++) {
++			if (shar_ps_data[cpu].coherence == 1) {
++				printk("S %d Coherence prob..bring tasks together \n",cpu);
++			}
++			else if (shar_ps_data[cpu].mem == 1) {
++				if (shar_ps_data[cpu].coherence == 1)
++					printk("S %d Mem prob but coherence prevents movement \n",
++					cpu);
++				else if (shar_ps_data[cpu].snoop == 1)
++					printk("S %d Mem prob but snooping prevents movement \n",
++					cpu);
++				else 
++					printk("S %d Mem prob..Move task \n",cpu);
++			}			
++		}
++	}
++	/* Test reading of MSRs. Exports MSR reads for debugging/ probing purposes */
++	if (num == 4) {
++		unsigned int low, high;
++		for (count = 0; count < data1; count++) {
++		    u64 __val = native_read_msr((FCC));
++        	(void)((low) = (u32)__val);
++	       	(void)((high) = (u32)(__val >> 32));
++		}
++	}
++	/* Write to MSR */
++	if (num == 5) {
++		for (count = 0; count < data1; count++)
++			native_write_msr(FCC, 819, 0);
++	}
++	/* Set up a round of performace counters */
++	if (num == 6) {
++		for (count = 0; count < data1; count++)
++			setup_round1(0);
++	}
++
++	/* Enable and disable task migrations */
++	if (num == 7) {
++		shar_move = data1;
++		shar_move_enable = 1;
++	}
++
++	/* Full fledged SAM with migrations */
++	if (num == 8) {
++		decide_processes();
++		//moving as pc data struct needs
++		for (cpu = 0; cpu < SHAR_NUM_SOCKETS*SHAR_PROCESSORS_CORE; cpu++) {
++			if (shar_pc_data[cpu].move_en == 1) {
++				move_to_cpu_sys(cpu,shar_pc_data[cpu].move);
++				shar_pc_data[cpu].move_en = 0;
++				printk("moving %d from %d to %d\n",shar_pc_data[cpu].move,shar_pc_data[cpu].move_from,cpu);
++			}
++		}
++		for (cpu = 0; cpu < SHAR_NUM_SOCKETS; cpu++)
++			reset_measure(cpu);
++	}
++	/* Observe without migration */
++	if (num == 9) {
++		observe_processes();
++		for (cpu = 0; cpu < SHAR_NUM_SOCKETS; cpu++)
++			reset_measure(cpu);
++	}
++
++	/* Detailed performance counter dump for all cores */
++	if (num == 10) { // printing data collected 
++		cpu = data1;
++		for (count = 0; count < SHAR_PROCESSORS_CORE; count++, 
++			 cpu+=SHAR_NUM_SOCKETS) {
++                	rq = cpu_rq(cpu);
++	                tsk = rq->curr;		
++			printk(" CPU %d \n Name %s \n Instructions %ld \n Cycles %ld \n",
++					cpu,tsk->comm,tsk->sure.inst, tsk->sure.unhalted);
++	        }
++		printk("Shar end socket print \n");
++	}
++	return 0;
++}
++
++/* SAM Addition
++ * Reset per socket information 
++ * sps: Pointer to the per socket data structure to be reset */
++static void shar_reset_ps_data(struct shar_per_socket* sps)
++{
++	// Resetting Per-socket information
++	sps->tot_mem = 0;
++	sps->tot_crosssoc = 0;
++	sps->tot_snoopsoc = 0;
++	sps->active_processes = 0;
++	sps->snum = -1;
++	sps->dnew = 0;
++	sps->p_mem = 0;
++	sps->p_snoop = 0;
++	sps->p_coherence = 0;
++	sps->p_remote = 0;
++	return;
++}
++
++/* SAM Addition
++ * Setup the first round of performance counters. There are 2 rounds
++ * cpu: Core to be setup with counters  */
++static void setup_round1(const int cpu)
++{
++    unsigned int low, high; 
++        
++    // Resetting counters 
++    low = 0;
++    high = 0;
++    native_write_msr(FC0,0,0);
++    native_write_msr(FC1,0,0);
++    native_write_msr(FC2,0,0);
++    native_write_msr(PC0,0,0);
++    native_write_msr(PC1,0,0);
++    native_write_msr(PC2,0,0);
++    native_write_msr(PC3,0,0);
++        
++    // Set individual and then global status and disable interrupts for counters
++    native_write_msr(PCC0,0x004110d1,0);
++    native_write_msr(PCC1,0x004104d1,0);
++    native_write_msr(PCC2,0x0041412e,0);
++	native_write_msr(PCC3,0x00410cd3,0);
++    native_write_msr(FCC,819,0);
++    native_write_msr(GLC,15,7);
++    return;
++}
++
++/* SAM Addition
++ * Setup round 2 of the performance counter monitoring. 
++ * cpu: Core on which the setup needs to be done */
++static void setup_round2(const int cpu)
++{
++    unsigned int low, high;
++        
++    // Resetting counters 
++    low = 0;
++    high = 0;
++    native_write_msr(FC0,0,0);
++    native_write_msr(FC1,0,0);
++    native_write_msr(FC2,0,0);
++    native_write_msr(PC0,0,0);
++    native_write_msr(PC1,0,0);
++    native_write_msr(PC2,0,0);
++    native_write_msr(PC3,0,0);
++        
++    // Set individual and then global status and disable interrupts for counters
++    native_write_msr(PCC0,0x004120d3,0);
++    native_write_msr(PCC1,0x004110d3,0);
++    native_write_msr(PCC2,0x004120d1,0);
++	native_write_msr(PCC3,0x004101b7,0);
++    native_write_msr(FCC,819,0);
++    native_write_msr(GLC,15,7);
++	native_write_msr(OFF0,0xFFC00030,0x3F);
++    return;
++}
++
++/* SAM Addition
++ * Read the results after setting up round 1. Round 2 will be setup after this.
++ * cpu: core for the measurement
++ * tsk: Pointer to the task struct that is active on that core */
++static void collect_round1(const int cpu, struct task_struct *tsk)
++{
++        // Disable the counters 
++    native_write_msr(PCC0,0x000110d1,0);
++    native_write_msr(PCC1,0x000104d1,0);
++    native_write_msr(PCC2,0x0001412e,0);
++	native_write_msr(PCC3,0x00010cd3,0);
++
++    tsk->temp.inst = native_read_msr(FC0);
++    tsk->temp.cycles = native_read_msr(FC1);
++    tsk->temp.unhalted = native_read_msr(FC2);
++	tsk->temp.unhalted1 = tsk->temp.unhalted; 
++	tsk->temp.llc_l2miss = native_read_msr(PC0);
++	tsk->temp.llc_l3hit = native_read_msr(PC1);
++	tsk->temp.llc_misses = native_read_msr(PC2);
++	tsk->temp.remote_dram = native_read_msr(PC3);
++
++	// Log
++	tsk->log.unhalted1 += tsk->temp.unhalted1;
++	tsk->log.llc_l2miss += tsk->temp.llc_l2miss;
++	tsk->log.llc_l3hit += tsk->temp.llc_l3hit;
++	tsk->log.llc_misses += tsk->temp.llc_misses;
++	tsk->log.remote_dram += tsk->temp.remote_dram;
++    return;
++}
++
++/* SAM Addition
++ * Read the results after setting up round 2. Round 3/1 will be setup after this.
++ * cpu: core for the measurement
++ * tsk: Pointer to the task struct that is active on that core */
++
++static void collect_round2(const int cpu, struct task_struct *tsk)
++{
++    // Disable the counters 
++    native_write_msr(PCC0,0x000120d3,0);
++    native_write_msr(PCC1,0x000110d3,0);
++    native_write_msr(PCC2,0x000120d1,0);//0x0001412e to 30d1
++	native_write_msr(PCC3,0x000101b7,0);
++
++    tsk->temp.inst += native_read_msr(FC0);
++	tsk->log.inst += tsk->temp.inst; // Log
++    tsk->temp.inst = tsk->temp.inst / 2;
++    tsk->temp.cycles += native_read_msr(FC1);
++	tsk->log.cycles += tsk->temp.cycles; // Log
++    tsk->temp.cycles = tsk->temp.cycles / 2;
++    tsk->temp.unhalted2 = native_read_msr(FC2);
++	tsk->temp.unhalted += tsk->temp.unhalted2;
++	tsk->log.unhalted += tsk->temp.unhalted; // Log
++	tsk->log.unhalted2 += tsk->temp.unhalted2; // Log
++    tsk->temp.unhalted = tsk->temp.unhalted / 2;
++    tsk->temp.llc_remotefwd = native_read_msr(PC0);
++    tsk->temp.llc_remotehitm = native_read_msr(PC1);
++    tsk->temp.llc_l3miss = native_read_msr(PC2);
++	tsk->temp.llc_prefetch = native_read_msr(PC3);
++	// Log
++	tsk->log.llc_remotefwd += tsk->temp.llc_remotefwd;
++	tsk->log.llc_remotehitm += tsk->temp.llc_remotehitm;
++	tsk->log.llc_l3miss += tsk->temp.llc_l3miss;
++	tsk->log.llc_prefetch += tsk->temp.llc_prefetch;
++    return;
++}
++
++/* SAM Addition
++ * Perform per task performance counter data consolidation
++ * snum: Socket number
++ * Looks at every core in the socket and collects the time 
++ * multiplexed hardware performance
++ * counter information. Extracts the different metrics 
++ * indirectly from these metrics.
++ * Marks different per task bottlenecks. Augments logs. 
++ * Setups up per socket data structures.
++ * Flags socket level bottleneck priorities */
++static int check_socket_ready (const int snum)
++{
++    int cpu = snum%SHAR_NUM_SOCKETS, count;
++    struct task_struct *tsk;
++    struct rq *rq;
++	struct shar_per_socket temp;
++	long temp_soc;
++	int sign = 0;
++	int rep = 0;
++	SHAR_PROCESSORS_CON = 20; 
++	shar_reset_ps_data(&temp);
++	// Start the data consolidation phase
++	// Start with collecting performance counter data per task
++	// Accumulate per-socket statistics, identify bottlenecks
++    for (count = 0; count < SHAR_PROCESSORS_CORE; count++,cpu+=SHAR_NUM_SOCKETS) {
++                rq = cpu_rq(cpu);
++                tsk = rq->curr;
++		// Reset per core data structure prior to data collection
++		shar_pc_data[cpu].active = 0;
++		shar_pc_data[cpu].snoop = 0;
++		shar_pc_data[cpu].coherence = 0;
++		shar_pc_data[cpu].mem = 0;
++		shar_pc_data[cpu].remote_mig = 0;
++		shar_pc_data[cpu].snp = 0;
++		shar_pc_data[cpu].mm = 0;
++		shar_pc_data[cpu].coh = 0;
++		shar_mmmap[cpu].users = -1;
++		shar_mmmap[cpu].mm = NULL;
++		shar_mmmap[cpu].pid = 0;
++		if (tsk->pid > shar_id && tsk->collection_active!=0) {
++			rep = 0;
++            while (tsk->round_collection == 3) {
++				shar_end = cpu;
++				shar_end1 = tsk->pid;
++				rep++;
++				if (rep > 100) {
++					printk("SAM Error:Waited for %d in CPU %d \n",tsk->pid,cpu);
++					return -1;
++				}
++			}
++		 	// MEM USAGE
++			temp_soc = (long)(SHAR_CYCLES*(((float)(tsk->sure.llc_misses+
++							tsk->sure.llc_prefetch))/(tsk->sure.unhalted1+1)));
++			temp.tot_mem += temp_soc;
++			tsk->log.tot_mem += temp_soc; // Log
++			if (temp_soc > SHAR_MEM_THRESH/SHAR_PROCESSORS_CORE) {
++				shar_pc_data[cpu].mem = 1;
++				temp.p_mem++;
++				tsk->log.prob_mem++; // Log
++			}
++			shar_pc_data[cpu].mm = temp_soc;
++			shar_pc_data[cpu].active = 1;
++			
++			// REMOTE_DRAM
++			temp_soc = (long)(SHAR_CYCLES*((float)tsk->sure.remote_dram/
++									(tsk->sure.unhalted1+1)));
++			tsk->log.tot_rdram += temp_soc; // Log
++			if (temp_soc > SHAR_REMOTE_THRESH) { 
++				tsk->log.prob_rdram++; // Log
++				if (tsk->remote_mig == 0)
++					tsk->remote_mig = -1;
++				if (tsk->remote_mig == -1) {
++					tsk->remote_mig = (snum%SHAR_NUM_SOCKETS)+1;
++				}
++			}
++			shar_pc_data[cpu].remote_mig = tsk->remote_mig;
++			if (tsk->remote_mig != 0) {
++				if (tsk->remote_mig == (snum%SHAR_NUM_SOCKETS)+1)
++					temp.p_remote++;
++			}
++			shar_pc_data[cpu].rdram = temp_soc;
++			// SNOOP IN SOC
++			sign = tsk->sure.llc_l2miss-(tsk->sure.llc_l3hit)-
++				   (tsk->sure.llc_l3miss);
++			temp_soc = sign * (long)1000;
++			if (sign > 0) {
++				tsk->log.tot_snp += temp_soc; // Log
++				if (temp_soc > SHAR_COHERENCE_THRESH) {
++					shar_pc_data[cpu].snoop = 1;
++					temp.p_snoop++;
++					tsk->log.prob_snp++; // Log
++				}
++				temp.tot_snoopsoc += temp_soc;
++				shar_pc_data[cpu].snp = temp_soc;
++			}
++			// CROSS SOC
++			temp_soc = (long)(SHAR_CYCLES*((tsk->sure.llc_remotefwd + 
++					tsk->sure.llc_remotehitm)/(float)(tsk->sure.unhalted2+1)));
++			tsk->log.tot_coh += temp_soc; // Log
++			if (temp_soc > SHAR_COHERENCE_THRESH) {
++				shar_pc_data[cpu].coherence = 1;
++				temp.p_coherence++;
++				tsk->log.prob_coh++; // Log
++			}
++			temp.tot_crosssoc += temp_soc;
++			shar_pc_data[cpu].coh = temp_soc;
++			temp.active_processes += 1;
++			//MMAP INFO
++			if (tsk->pid > shar_id && tsk->mm != NULL) {
++				shar_mmmap[cpu].mm = tsk->mm;
++				shar_mmmap[cpu].users = (int)tsk->mm->mm_users.counter;
++				shar_mmmap[cpu].pid =tsk->pid;
++			}
++		}
++		if (temp.active_processes<10)
++			SHAR_PROCESSORS_CON = 10;
++    }
++
++	// Update per socket information
++	shar_ps_data[snum%SHAR_NUM_SOCKETS].tot_mem = temp.tot_mem;
++	shar_ps_data[snum%SHAR_NUM_SOCKETS].tot_crosssoc = temp.tot_crosssoc;
++	shar_ps_data[snum%SHAR_NUM_SOCKETS].tot_snoopsoc = temp.tot_snoopsoc;
++	shar_ps_data[snum%SHAR_NUM_SOCKETS].active_processes=temp.active_processes;
++	shar_ps_data[snum%SHAR_NUM_SOCKETS].snum = snum%SHAR_NUM_SOCKETS;
++	shar_ps_data[snum%SHAR_NUM_SOCKETS].dnew = 1;
++	shar_ps_data[snum%SHAR_NUM_SOCKETS].p_mem = temp.p_mem;
++	shar_ps_data[snum%SHAR_NUM_SOCKETS].p_snoop = temp.p_snoop;
++	shar_ps_data[snum%SHAR_NUM_SOCKETS].p_coherence = temp.p_coherence;
++	shar_ps_data[snum%SHAR_NUM_SOCKETS].p_remote = temp.p_remote;
++
++	return 0;
++}
++/* SAM Addition
++ * Reset performance counter time multiplexing logic
++ */ 
++static int reset_measure(const int snum)
++{
++	// Reset the per task performance counter collection state machine
++	int cpu = snum, count;
++    struct task_struct *tsk;
++    struct rq *rq;
++	
++    for (count = 0; count < SHAR_PROCESSORS_CORE; count++,cpu+=SHAR_NUM_SOCKETS) {
++	rq = cpu_rq(cpu);
++        tsk = rq->curr;
++		if (tsk->pid > shar_id) {
++          	tsk->round_collection = 5;
++	        tsk->collection_active = 0;
++		}
++    }
++	shar_ps_data[snum].dnew = 0;
++    return 0;
++}
++/* SAM Addition
++ * Ear mark tasks to be migrated
++ * Mark tasks for CPU migration
++ * cpu: Target CPU
++ * tsk: Task struct of task to be migrated
++ */
++static void move_to_cpu(const int cpu, struct task_struct *tsk)
++{
++	shar_pc_data[cpu].move = tsk->pid;
++	shar_pc_data[cpu].move_en = 1;
++	return;
++}
++/* SAM Addition
++ * Per task performance counter collection mechanism
++ */
++static void monitor_processes(const int cpu1)
++{
++	struct task_struct *tsk1;
++	struct rq *rq1;
++
++ 	rq1 = cpu_rq(cpu1);
++	tsk1 = rq1->curr;
++	
++	if (tsk1->pid > shar_id) {       
++        // Collection of parameters
++		if (tsk1->collection_active != 1) {
++			// Task has not been set with anything to monitor. It has to be. 
++			tsk1->collection_active = 1;
++			tsk1->round_collection = 1;
++			setup_round1(cpu1);
++		}
++		else {
++			if (tsk1->round_collection == 1) {
++				collect_round1(cpu1, tsk1);
++				setup_round2(cpu1);
++				tsk1->round_collection = 2;
++			}
++			else if(tsk1->round_collection == 2) {
++				collect_round2(cpu1,tsk1);
++				tsk1->round_collection = 3;
++				tsk1->sure = tsk1->temp;
++				tsk1->round_collection = 4;
++				tsk1->collection_active = 2;
++			}
++		}
++	}
++}
++/* SAM Addition
++ * Collect per socket information and flag per socket bottlenecks
++ */
++static void observe_processes()
++{
++	int snum;
++	int soc_count = 0, cpu1;
++
++	cpu1 = 0;
++	for (soc_count=0;soc_count<SHAR_NUM_SOCKETS; soc_count++, cpu1++) {
++		snum = cpu1 % SHAR_NUM_SOCKETS;
++		while (check_socket_ready(cpu1) != 0);
++		
++		shar_ps_data[snum].snoop = 0;
++		shar_ps_data[snum].coherence = 0;
++		shar_ps_data[snum].mem = 0;
++		if (shar_ps_data[snum].tot_crosssoc > SHAR_COHERENCE_THRESH)
++			shar_ps_data[snum].coherence = 1;		
++		if (shar_ps_data[snum].tot_snoopsoc > SHAR_COHERENCE_THRESH)
++			shar_ps_data[snum].snoop = 1;
++		if (shar_ps_data[snum].tot_mem > SHAR_MEM_THRESH)
++			shar_ps_data[snum].mem = 1;	
++	}
++	return;
++}
++/* SAM Addition
++ * Function for moving tasks with high remote memory access 
++ */
++void move_remote_mutual(int *num_sub, int no_mov, int *source, int move_done,
++			int iter, int iterd, int countj, int counti,
++			int destination, int *do_nothing)
++{
++	for (iter = 0; iter < SHAR_PROCESSORS_CORE && *num_sub > 0; iter++) {
++		(*source) = (iter*SHAR_NUM_SOCKETS)+counti;
++		if ((shar_pc_data[(*source)].remote_mig == counti+1) && 
++			(*source)!=no_mov && shar_pc_data[(*source)].move_en==0) {
++			move_done = 0;
++			while(iterd < SHAR_PROCESSORS_CON && move_done == 0) {
++				destination = (iterd*SHAR_NUM_SOCKETS)+countj;
++				if ((shar_pc_data[destination].remote_mig == countj+1) && 
++					 destination!=no_mov && 
++					 shar_pc_data[destination].move_en==0) {
++					shar_ps_data[counti].p_remote--;
++					shar_ps_data[countj].p_remote--;
++					shar_pc_data[destination].move_from = (*source);
++					shar_pc_data[(*source)].move_from = destination;
++					move_to_cpu(destination,cpu_rq(*source)->curr);
++					move_to_cpu(*source,cpu_rq(destination)->curr);
++					*num_sub = (*num_sub) - 1;
++					move_done = 1;
++					(*do_nothing) = 1;
++				}
++				iterd++;
++			}
++		}
++	}
++}
++/* SAM Addition
++ * Perform task to core mapping based on already gathered information
++ */ 
++static void decide_processes()
++{
++	int snum;
++	int soc_count = 0, cpu1;
++	int counti = 0, countj = 0, flag = 0;
++	int iter = 0, source = 0, destination = 0, iterd = 0;
++	int do_nothing = 0, move_done = 0;
++	int no_mov = smp_processor_id();
++	int num_sub = 0;
++	int temp_if = 0, des = 0, c = 0;
++
++	cpu1 = 0;
++	for (soc_count=0;soc_count<SHAR_NUM_SOCKETS; soc_count++, cpu1++) {
++		snum = cpu1 % SHAR_NUM_SOCKETS;
++		while (check_socket_ready(cpu1) != 0);
++		
++		shar_ps_data[snum].snoop = 0;
++		shar_ps_data[snum].coherence = 0;
++		shar_ps_data[snum].mem = 0;
++		if (shar_ps_data[snum].tot_crosssoc > SHAR_COHERENCE_THRESH)
++			shar_ps_data[snum].coherence = 1;		
++		if (shar_ps_data[snum].tot_snoopsoc > SHAR_COHERENCE_THRESH)
++			shar_ps_data[snum].snoop = 1;
++		if (shar_ps_data[snum].tot_mem > SHAR_MEM_THRESH)
++			shar_ps_data[snum].mem = 1;	
++	}
++	do_nothing = 0;
++	// Check if remote accesses are happening.. if none then go ahead and deal with the rest
++	// If there are remote accesses, exchange with the other socket apps that have remote accesses
++	// If there is no such application, swap with a idle processor or apps that do not bother about socket (less snoop, less mem)
++	for (counti = 0; counti < SHAR_NUM_SOCKETS; counti++) {
++		if (shar_ps_data[counti].p_remote > 0) {
++			// Now is where we check if there are straight substitutes
++			for (countj = 0; countj < SHAR_NUM_SOCKETS; countj++) {
++				if (shar_ps_data[countj].p_remote > 0 && (counti != countj)) {
++				    	num_sub = shar_ps_data[counti].p_remote;
++					iterd = 0;
++					move_remote_mutual(&num_sub, no_mov, &source,
++					move_done, iter, iterd, countj, counti,
++					destination, &do_nothing);
++					       	       
++				}
++			}
++		}
++	}
++	for (counti = 0; counti < SHAR_NUM_SOCKETS; counti++) {
++		iterd = 0;
++		for (iter = 0; iter < SHAR_PROCESSORS_CORE; iter++) {
++			source = (iter*SHAR_NUM_SOCKETS)+counti;
++			if ((shar_pc_data[source].remote_mig == counti+1) && 
++				source!=no_mov && shar_pc_data[source].move_en==0) {
++				move_done = 0;
++				for (countj = 0; countj < SHAR_NUM_SOCKETS; countj++) {
++					if (countj!=counti) {
++						iterd = 0;
++						while (iterd < SHAR_PROCESSORS_CON && move_done==0) {
++							destination = (iterd*SHAR_NUM_SOCKETS)+countj;
++							if (shar_pc_data[destination].active==0 && 
++								shar_pc_data[destination].move_en==0 && 
++								destination!=no_mov) {
++								shar_ps_data[counti].p_remote--;
++								move_to_cpu(destination,cpu_rq(source)->curr);
++								move_done = 1;
++								do_nothing = 1;
++								shar_pc_data[destination].move_from = source;
++								shar_pc_data[source].move_from = destination;
++							}
++							iterd++;
++						}
++						if (move_done == 0) {
++							iterd = 0;
++							while(iterd < SHAR_PROCESSORS_CON && move_done == 0) {
++								destination = (iterd*SHAR_NUM_SOCKETS)+countj;
++								temp_if = shar_pc_data[destination].remote_mig;
++								if (shar_pc_data[destination].coherence==0 && 
++									shar_pc_data[destination].snoop==0 && 
++									temp_if!=counti+1 && 
++									destination!=no_mov && 
++									shar_pc_data[destination].mem==0) {
++									des = destination;
++									shar_pc_data[des].active = 1;
++									shar_pc_data[des].mem = 1;
++									shar_pc_data[des].move_from = source;
++									shar_pc_data[source].move_from = des;
++									move_to_cpu(des,cpu_rq(source)->curr);
++									move_to_cpu(source,cpu_rq(des)->curr);
++									move_done = 1;
++									do_nothing = 1;
++								}
++								iterd++;									
++							}
++						}
++					}
++				}
++			}
++		}
++	}
++	if (do_nothing == 1) {
++		#ifdef CONFIG_SAM_DEBUG
++			printk("\n Moving remote stuff..\n");
++		#endif
++		return;
++	}
++	// Identify sharing aware tasks then memory and cache heavy tasks. 
++	for (counti = 0; counti < SHAR_NUM_SOCKETS && do_nothing == 0; counti++) {
++		flag = 0;
++		if (shar_ps_data[counti].coherence == 1) {
++			for (countj = counti + 1; flag == 0 && 
++				 countj < SHAR_NUM_SOCKETS; countj++) {
++				if (shar_ps_data[countj].coherence == 1) {
++					for (iter = 0; iter < SHAR_PROCESSORS_CORE; iter++) {
++						source = (iter*SHAR_NUM_SOCKETS)+countj;
++						if (shar_pc_data[source].coherence == 1 && 
++							shar_pc_data[source].active == 1) {
++							iterd = 0;
++							move_done = 0;
++							while(iterd < SHAR_PROCESSORS_CORE && 
++								  move_done == 0) {								
++								destination = (iterd*SHAR_NUM_SOCKETS)+counti;
++								if (shar_pc_data[destination].active == 0 && 
++									destination!=no_mov) {
++									des = destination; 
++									shar_pc_data[des].active = 1;
++									shar_pc_data[des].snoop = 1;
++									shar_pc_data[des].move_from = source;
++									move_to_cpu(des,cpu_rq(source)->curr);
++									move_done = 1;
++								}
++								iterd++;
++
++							}
++							if(move_done==0) {
++								iterd = 0;
++								while(iterd < SHAR_PROCESSORS_CORE && 
++									  move_done == 0) {								
++									des = (iterd*SHAR_NUM_SOCKETS)+counti;
++									if (shar_pc_data[des].snoop == 0 && 
++										shar_pc_data[des].coherence == 0 && 
++										shar_pc_data[des].mem == 0 && 
++										des!=no_mov) {
++										shar_pc_data[des].snoop = 1;
++										shar_pc_data[des].move_from=source;
++										shar_pc_data[source].move_from=des;
++										move_to_cpu(source,cpu_rq(des)->curr);
++										move_to_cpu(des,cpu_rq(source)->curr);
++										move_done = 1;
++									}
++									iterd++;
++								}
++								if(move_done==0) {
++									iterd = 0;
++									while(iterd < SHAR_PROCESSORS_CORE && 
++										  move_done == 0) {								
++										des = (iterd*SHAR_NUM_SOCKETS)+counti;
++										c = counti + 1;
++										if (shar_pc_data[des].snoop == 0 && 
++											shar_pc_data[des].coherence == 0 &&
++										   	des!=no_mov && 
++											(shar_pc_data[des].remote_mig != c)) {
++											shar_pc_data[des].snoop = 1;
++											shar_pc_data[source].move_from=des;
++											shar_pc_data[des].move_from=source;
++											move_to_cpu(source,
++														cpu_rq(des)->curr);
++											move_to_cpu(des,
++														cpu_rq(source)->curr);
++											move_done = 1;
++											do_nothing = 1;
++										}
++										iterd++;
++
++									}
++								}
++								
++							}
++						}							
++					}
++					flag = 1;							
++				}
++			}
++		}
++		if (do_nothing == 1) {
++			#ifdef CONFIG_SAM_DEBUG
++				printk("Swapped memory intensive threads\n");
++			#endif
++			return;
++		}
++		// Memory utilization related bottlenecks
++		flag = 0;
++		if (shar_ps_data[counti].mem == 1 && 
++			shar_ps_data[counti].coherence == 0 && 
++			shar_ps_data[counti].snoop == 0) {
++			flag = shar_ps_data[counti].p_mem/2;
++			for (countj = 0; flag > 0 && countj < SHAR_NUM_SOCKETS; countj++) {
++				if ((shar_ps_data[countj].mem == 0 && countj!=counti) || 
++				((shar_ps_data[countj].p_mem+1) < shar_ps_data[counti].p_mem)) {
++					if (!(shar_ps_data[countj].mem == 0 && countj!=counti))
++						flag = (shar_ps_data[counti].p_mem - 
++								shar_ps_data[countj].p_mem)/2;
++					for (iter = 0; iter < SHAR_PROCESSORS_CORE 
++						&& flag > 0; iter++) {
++						source = (iter*SHAR_NUM_SOCKETS)+counti;
++						if (shar_pc_data[source].mem == 1 && 
++							shar_pc_data[source].active == 1 && 
++							shar_pc_data[source].remote_mig==0 && 
++							shar_pc_data[source].snoop==0) {
++							iterd = 0;
++							move_done = 0;
++							while(iterd < SHAR_PROCESSORS_CORE && move_done==0) {						
++								destination = (iterd*SHAR_NUM_SOCKETS)+countj;
++								des = destination;
++								if (shar_pc_data[des].active == 0 && 
++									des!=no_mov) {
++									shar_pc_data[des].active = 1;
++									shar_pc_data[des].snoop = 1;
++									shar_pc_data[des].move_from=source;
++									move_to_cpu(des,cpu_rq(source)->curr);
++									move_done = 1;
++									flag--;
++								}
++								iterd++;
++							}
++							if(move_done==0) {
++								iterd = 0;
++								while(iterd < SHAR_PROCESSORS_CORE && 
++									  move_done == 0) {								
++									des = (iterd*SHAR_NUM_SOCKETS)+counti;
++									if (shar_pc_data[des].snoop == 0 && 
++										shar_pc_data[des].coherence == 0 && 
++										shar_pc_data[des].mem == 0 && 
++										des!=no_mov) {
++										shar_pc_data[des].snoop = 1;
++										move_to_cpu(source,cpu_rq(des)->curr);
++										move_to_cpu(des,cpu_rq(source)->curr);
++										move_done = 1;
++										flag--;
++									}
++									iterd++;
++								}
++
++							}
++						}
++					}						
++				}
++			}
++		}
++	}
++	for (counti = 0; counti < SHAR_NUM_SOCKETS && do_nothing == 0; counti++)
++		reset_measure(counti);	
++}
++
++static int shar_swap_count = 0;
+ 
+ void start_bandwidth_timer(struct hrtimer *period_timer, ktime_t period)
+ {
+@@ -2436,7 +3377,12 @@
+ 	struct task_struct *curr = rq->curr;
+ 
+ 	sched_clock_tick();
+-
++	// Mine SHAR
++	if (shar_enable == 1) {
++		shar_swap_count++;
++		monitor_processes(cpu);
++	}
++	// SHAR
+ 	raw_spin_lock(&rq->lock);
+ 	update_rq_clock(rq);
+ 	curr->sched_class->task_tick(rq, curr, 0);
+@@ -2577,6 +3523,7 @@
+ 	schedstat_inc(this_rq(), sched_count);
+ }
+ 
++
+ static void put_prev_task(struct rq *rq, struct task_struct *prev)
+ {
+ 	if (prev->on_rq || rq->skip_clock_update < 0)
+@@ -2592,12 +3539,13 @@
+ {
+ 	const struct sched_class *class;
+ 	struct task_struct *p;
+-
+ 	/*
+ 	 * Optimization: we know that if all tasks are in
+ 	 * the fair class we can call that function directly:
+ 	 */
+ 	if (likely(rq->nr_running == rq->cfs.h_nr_running)) {
++		
++		
+ 		p = fair_sched_class.pick_next_task(rq);
+ 		if (likely(p))
+ 			return p;
+@@ -2655,7 +3603,7 @@
+ 	unsigned long *switch_count;
+ 	struct rq *rq;
+ 	int cpu;
+-
++	
+ need_resched:
+ 	preempt_disable();
+ 	cpu = smp_processor_id();
+@@ -2725,8 +3673,10 @@
+ 		 */
+ 		cpu = smp_processor_id();
+ 		rq = cpu_rq(cpu);
+-	} else
++	} else	{
++
+ 		raw_spin_unlock_irq(&rq->lock);
++	}
+ 
+ 	post_schedule(rq);
+ 
+@@ -3242,17 +4192,40 @@
+  * We ask for the deadline not being zero, and greater or equal
+  * than the runtime, as well as the period of being zero or
+  * greater than deadline. Furthermore, we have to be sure that
+- * user parameters are above the internal resolution (1us); we
+- * check sched_runtime only since it is always the smaller one.
++ * user parameters are above the internal resolution of 1us (we
++ * check sched_runtime only since it is always the smaller one) and
++ * below 2^63 ns (we have to check both sched_deadline and
++ * sched_period, as the latter can be zero).
+  */
+ static bool
+ __checkparam_dl(const struct sched_attr *attr)
+ {
+-	return attr && attr->sched_deadline != 0 &&
+-		(attr->sched_period == 0 ||
+-		(s64)(attr->sched_period   - attr->sched_deadline) >= 0) &&
+-		(s64)(attr->sched_deadline - attr->sched_runtime ) >= 0  &&
+-		attr->sched_runtime >= (2 << (DL_SCALE - 1));
++	/* deadline != 0 */
++	if (attr->sched_deadline == 0)
++		return false;
++
++	/*
++	 * Since we truncate DL_SCALE bits, make sure we're at least
++	 * that big.
++	 */
++	if (attr->sched_runtime < (1ULL << DL_SCALE))
++		return false;
++
++	/*
++	 * Since we use the MSB for wrap-around and sign issues, make
++	 * sure it's not set (mind that period can be equal to zero).
++	 */
++	if (attr->sched_deadline & (1ULL << 63) ||
++	    attr->sched_period & (1ULL << 63))
++		return false;
++
++	/* runtime <= deadline <= period (if period != 0) */
++	if ((attr->sched_period != 0 &&
++	     attr->sched_period < attr->sched_deadline) ||
++	    attr->sched_deadline < attr->sched_runtime)
++		return false;
++
++	return true;
+ }
+ 
+ /*
+@@ -3680,8 +4653,12 @@
+ 	if (!uattr || pid < 0 || flags)
+ 		return -EINVAL;
+ 
+-	if (sched_copy_attr(uattr, &attr))
+-		return -EFAULT;
++	retval = sched_copy_attr(uattr, &attr);
++	if (retval)
++		return retval;
++
++	if ((int)attr.sched_policy < 0)
++		return -EINVAL;
+ 
+ 	rcu_read_lock();
+ 	retval = -ESRCH;
+@@ -3731,7 +4708,7 @@
+  */
+ SYSCALL_DEFINE2(sched_getparam, pid_t, pid, struct sched_param __user *, param)
+ {
+-	struct sched_param lp;
++	struct sched_param lp = { .sched_priority = 0 };
+ 	struct task_struct *p;
+ 	int retval;
+ 
+@@ -3748,11 +4725,8 @@
+ 	if (retval)
+ 		goto out_unlock;
+ 
+-	if (task_has_dl_policy(p)) {
+-		retval = -EINVAL;
+-		goto out_unlock;
+-	}
+-	lp.sched_priority = p->rt_priority;
++	if (task_has_rt_policy(p))
++		lp.sched_priority = p->rt_priority;
+ 	rcu_read_unlock();
+ 
+ 	/*
+@@ -5051,7 +6025,6 @@
+ 				      unsigned long action, void *hcpu)
+ {
+ 	switch (action & ~CPU_TASKS_FROZEN) {
+-	case CPU_STARTING:
+ 	case CPU_DOWN_FAILED:
+ 		set_cpu_active((long)hcpu, true);
+ 		return NOTIFY_OK;
+diff -ruN vanilla-3.14/kernel/sched/core.h SAM_2015/kernel/sched/core.h
+--- vanilla-3.14/kernel/sched/core.h	1969-12-31 19:00:00.000000000 -0500
++++ SAM_2015/kernel/sched/core.h	2017-12-10 21:38:41.976691041 -0500
+@@ -0,0 +1,151 @@
++/*
++ *  core.h
++ *
++ *  Header file for SAM scheduler related data structures
++ *
++ *  2016-12-21  Sharing Aware Mapper (SAM) code additions.
++ *  Contributors: Sharanyan Srikanthan, Sandhya Dwarkadas, and Kai Shen
++ *  University of Rochester
++ */
++
++/* System calls used for setting up SAM, debugging, etc */
++#define _SHAR_RDMSR_ 317
++#define _SHAR_WRMSR_ 318 
++
++/* Macros for performance counters and its control registers 
++ Refer to the Intel Arch Manual */
++#define IA32_FIXED_CTR_CTRL 0x38D
++#define IA32_PERF_GLOBAL_CTRL 0x38F
++#define PERF_FIXED_CTR0 0x309
++#define PERF_FIXED_CTR1 0x30A
++#define PERF_FIXED_CTR2 0x30B
++#define PerfEvtSel0 0x186
++#define PerfEvtSel1 0x187
++#define PerfEvtSel2 0x188
++#define PerfEvtSel3 0x189
++#define IA32_PMC0 0xC1
++#define IA32_PMC1 0xC2
++#define IA32_PMC2 0xC3
++#define IA32_PMC3 0xC4
++#define OFFCORE_RSP_0 0x1A6
++
++#define FC0 PERF_FIXED_CTR0
++#define FC1 PERF_FIXED_CTR1
++#define FC2 PERF_FIXED_CTR2
++#define FCC IA32_FIXED_CTR_CTRL
++#define GLC IA32_PERF_GLOBAL_CTRL
++#define PCC0 PerfEvtSel0
++#define PCC1 PerfEvtSel1
++#define PCC2 PerfEvtSel2
++#define PCC3 PerfEvtSel3
++#define PC0 IA32_PMC0
++#define PC1 IA32_PMC1
++#define PC2 IA32_PMC2
++#define PC3 IA32_PMC3
++#define OFF0 OFFCORE_RSP_0
++/* Machine specific information. 
++   Can be exported into config in the future or read
++   in real time */
++
++#define MAX_SHAR_NUM_SOCKETS 2
++int SHAR_NUM_SOCKETS = MAX_SHAR_NUM_SOCKETS;
++#define MAX_SHAR_PROCESSORS_CORE 20
++#define DEBUG_SAM 0
++
++int SHAR_PROCESSORS_CORE = MAX_SHAR_PROCESSORS_CORE;
++int SHAR_PROCESSORS_CON = MAX_SHAR_PROCESSORS_CORE;
++
++/* Performance counter based threshold. Explained in 
++ * USENIX ATC paper 2015 */
++int SHAR_MEM_THRESH = 75000000;
++int SHAR_COHERENCE_THRESH = 550000;
++#define SHAR_REMOTE_THRESH 2700000
++#define SHAR_CYCLES 2200000000.0
++#define SHAR_COH_IND SHAR_COHERENCE_THRESH/2
++
++/* Enabling SAM. 
++   shar_enable: is to be set to 1. Otherwise,
++   behaves like a regular kernel. 
++   shar_id: is mostly to be used for debugging. It prevents SAM
++   from migrating tasks that are equal or less than the set PID. 
++   Was used to prevent migration of some kernel threads initially. 
++   shar_task: to identify the SAM daemon during debugging.
++   shar_ready: used internally.  */
++
++int shar_enable;
++int shar_task = 9999;
++int shar_id = 5000;
++int shar_print = 0;
++int shar_ready = 0;
++int shar_end;
++int shar_end1;
++int shar_move = 9999;
++int shar_move_enable = 0;
++
++/* Per socket data. Contains number of memory, intra & inter socket 
++ * coherence intensive, tasks. Stores consolidated numbers for each socket */
++struct shar_per_socket
++{
++	long tot_mem; // Memory activity
++	long tot_crosssoc; // Inter-socket coherence activity
++	long tot_snoopsoc; // Intra-socket coherence activity
++	int active_processes; // Active tasks
++	int snum; // Socket number
++	int dnew; // Used for reseting struct
++	// Different bottlenecks and number of threads contributing to them
++	int mem; 
++	int p_remote;	
++	int coherence;
++	int snoop;
++	int p_mem;
++	int p_coherence;
++	int p_snoop;
++};
++struct shar_per_socket shar_ps_data[MAX_SHAR_NUM_SOCKETS];
++
++/* Per core data structure. Time multiplexed performance counter information
++ * is consolidated per core and stored here. Any task migrations are also stored
++ * here */
++struct shar_per_core
++{	
++	int coherence;
++	int mem;
++	int snoop;
++	int active;
++	int move_en;
++	int move;
++	int move_from;
++	int remote_mig;
++	long coh;
++	long snp;
++	long mm;
++	long rdram;
++};
++
++struct shar_mem_map_core
++{
++	struct mm_struct *mm; // Not relevant for normal use
++	int users;
++	int pid;
++};
++struct shar_mem_map_core shar_mmmap[MAX_SHAR_PROCESSORS_CORE*MAX_SHAR_NUM_SOCKETS];
++struct shar_per_core shar_pc_data[MAX_SHAR_PROCESSORS_CORE*MAX_SHAR_NUM_SOCKETS];
++
++/* Mark for task migration. 
++ * cpu: Destination core
++ * tsk: Pointer to the task struct of the task to be moved */
++static void move_to_cpu(const int cpu, struct task_struct *tsk);
++
++/* Decide on task migrations using already per core and per socket
++ * data. Requires consolidation to be performed. Identifies different
++ * task migrations to be performed, which is performed later on in bulk */
++static void decide_processes(void);
++
++/* Use mainly during debugging to use consolidated information to flag overall
++ * bottlenecks. Does not instruct any task migrations. Needs consolidated performance
++ * counter data. */
++static void observe_processes(void);
++
++/* Resets data structures as and when necessary. Is performed per socket. 
++ * snum: Socket number */
++
+diff -ruN vanilla-3.14/README SAM_2015/README
+--- vanilla-3.14/README	2014-03-30 23:40:15.000000000 -0400
++++ SAM_2015/README	2017-12-10 21:39:17.714367039 -0500
+@@ -1,4 +1,10 @@
+-        Linux kernel release 3.x <http://kernel.org/>
++For any questions, please contact Sharanyan Srikanthan
++at srikanth@cs.rochester.edu
++
++Paper link: https://www.cs.rochester.edu/u/srikanth/Publications/atc16_paper-srikanthan.pdf 
++
++Linux kernel release 3.x <http://kernel.org/>
++
+ 
+ These are the release notes for Linux version 3.  Read them carefully,
+ as they tell you what this is all about, explain how to install the
+diff -ruN vanilla-3.14/README_SAM SAM_2015/README_SAM
+--- vanilla-3.14/README_SAM	1969-12-31 19:00:00.000000000 -0500
++++ SAM_2015/README_SAM	2017-12-10 21:39:17.715367058 -0500
+@@ -0,0 +1,38 @@
++For the usual compilation and installation instructions, refer to the README.
++
++This file talks about the specific parameters needed to be initialized for SAM.
++These parameters are obtained by offline characterization of the underlying hardware platform.
++
++All these parameters are present in kernel/sched/core.h
++Details on these parameters is explained in this file. Information on setting
++thresholds is explained in the paper: 
++Sharanyan Srikanthan, Sandhya Dwarkadas, and Kai Shen, "Data Sharing or Resource Contention: Toward Performance Transparency on Multicore Systems", In Proc. of the USENIX Annual Technical Conference, Santa Clara, CA, July 2015
++
++These are following are architecture specific MSRs. They do not have to changed for
++IvyBridge, SandyBridge, Haswell, Broadwell, etc. Please do refer to the architectural manual for any future changes. 
++#define IA32_FIXED_CTR_CTRL 0x38D
++#define IA32_PERF_GLOBAL_CTRL 0x38F
++#define PERF_FIXED_CTR0 0x309
++#define PERF_FIXED_CTR1 0x30A
++#define PERF_FIXED_CTR2 0x30B
++#define PerfEvtSel0 0x186
++#define PerfEvtSel1 0x187
++#define PerfEvtSel2 0x188
++#define PerfEvtSel3 0x189
++#define IA32_PMC0 0xC1
++#define IA32_PMC1 0xC2
++#define IA32_PMC2 0xC3
++#define IA32_PMC3 0xC4
++#define OFFCORE_RSP_0 0x1A6
++
++The following are machine dependent parameters that are to be set for every machine:
++#define MAX_SHAR_NUM_SOCKETS 2 // The number of sockets
++#define MAX_SHAR_PROCESSORS_CORE 20 // Number of logical cores in a socket           
++int SHAR_MEM_THRESH = 75000000;   // LLC_MISSES threshold as described in the paper
++int SHAR_COHERENCE_THRESH = 550000; // Inter-socket coherence activity threshold as described in paper
++#define SHAR_REMOTE_THRESH 2700000  // Similar threshold for remote memory accesses 
++#define SHAR_CYCLES 2200000000.0    // Number of cycles max CPU cycles in a second
++
++The above values can be changed dynamically, if required, to control the experiments as needed.
++
++Refer util/ for initializing and deploying SAM on Linux
+Binary files vanilla-3.14/util/deploy and SAM_2015/util/deploy differ
+diff -ruN vanilla-3.14/util/deploy.c SAM_2015/util/deploy.c
+--- vanilla-3.14/util/deploy.c	1969-12-31 19:00:00.000000000 -0500
++++ SAM_2015/util/deploy.c	2017-12-10 21:39:32.304643016 -0500
+@@ -0,0 +1,25 @@
++#include <stdio.h>
++#include <linux/unistd.h>
++#include <sys/syscall.h>
++
++#define _SHAR_GATHER_ 319 
++
++int main(int argc, char *argv[])
++{
++	long i;
++	int count = 0, lim = 100;
++	int pid = 1; // Does not matter 
++  
++	if (argc > 1)
++	{
++		lim = atoi(argv[1]);
++	}
++  
++	while(1)
++	{
++ 		i = syscall(_SHAR_GATHER_ ,8  , pid , 0);
++		usleep(lim*1000);
++		count++;
++	}
++   	return 0;
++}
+Binary files vanilla-3.14/util/HuBench and SAM_2015/util/HuBench differ
+diff -ruN vanilla-3.14/util/HuBench.c SAM_2015/util/HuBench.c
+--- vanilla-3.14/util/HuBench.c	1969-12-31 19:00:00.000000000 -0500
++++ SAM_2015/util/HuBench.c	2017-12-10 21:39:32.303642998 -0500
+@@ -0,0 +1,111 @@
++#define _GNU_SOURCE
++#include <pthread.h>
++#include <stdio.h>
++#include <sched.h>
++#include <stdlib.h>
++#define NUM_THREADS 4 
++#define NUM_ITER 2000000 // For elongating the run
++#define NUM_ITER_IDLE 10
++#define INNER_ITER 20
++#define SIZE_CRIT 32
++
++int ARRAY_SIZE = 8;
++int sum[NUM_THREADS];
++int sum_ex = NUM_THREADS*NUM_ITER*INNER_ITER;
++pthread_mutex_t mutexsum[NUM_THREADS];
++int shared_array[NUM_THREADS][SIZE_CRIT];
++pthread_mutex_t mut[NUM_THREADS]; // = PTHREAD_MUTEX_INITIALIZER;
++pthread_cond_t cond[NUM_THREADS]; // = PTHREAD_COND_INITIALIZER;
++int barrier_arrived[NUM_THREADS][32];
++	
++void *PrintHello(void *threadid)
++{
++   long tid;
++   int cnt = 0;
++   int spin_time = 0;
++   tid = (long)threadid;
++   char flnm[10];
++   cpu_set_t  mask;
++   CPU_ZERO(&mask);
++
++   int int_a, int_b, int_sum;
++
++   printf("Hello World! It's me, thread #%ld!\n", tid);
++   int i, j, k;
++   for(i=0; i<NUM_ITER; i++)
++   {
++		for (j=0; j<INNER_ITER; j++)
++		{
++			cnt++;
++			if (tid%2 == 1)
++			{
++				while(barrier_arrived[tid-1][0] == cnt-1)
++					spin_time++;
++			}	
++			for (k=0; k<SIZE_CRIT; k=k+SIZE_CRIT)	
++			{
++				shared_array[tid][k] += 1;
++				if (tid%2 == 1)
++				{
++					shared_array[tid-1][k] += 1;
++				}
++				else
++				{
++					shared_array[tid+1][k] += 1;
++				}
++			}
++					
++			barrier_arrived[tid][0] += 1;
++			for (k=0;k<ARRAY_SIZE*NUM_ITER_IDLE;k++)
++			{
++				int_a = k;
++				int_b = int_a*k;
++				int_sum = int_a * int_b;
++			}
++
++			if (tid%2 == 0)
++			{
++				while(barrier_arrived[tid+1][0] == cnt-1)
++				spin_time++;
++			}		
++
++		}
++	}
++    sum[tid] = spin_time/(NUM_ITER*INNER_ITER);
++
++	printf("Thread %d done \n",tid);
++    pthread_exit(NULL);
++}
++
++int main (int argc, char *argv[])
++{
++   	pthread_t threads[NUM_THREADS];
++   	int rc;
++   	long t;
++   	void *status;
++   	pthread_mutex_init(&mutexsum[1], NULL);
++   	pthread_mutex_init(&mutexsum[0], NULL);
++   	
++	//if (argc > 1)
++   	//ARRAY_SIZE = atoi(argv[1]);
++   	printf("\n Array Size %d \n", ARRAY_SIZE);
++   	for(t=0; t<NUM_THREADS; t++)
++   	{
++   	printf("In main: creating thread %ld\n", t);
++   	rc = pthread_create(&threads[t], NULL, PrintHello, (void *)(t+4));
++	if (rc)
++		{
++			printf("ERROR; return code from pthread_create() is %d\n", rc);
++			return -1;
++		}
++   	}
++
++   	for(t=0; t<NUM_THREADS; t++)
++   	{
++		pthread_join(threads[t], &status);
++   	}
++
++   	fprintf(stderr,"\n\n");
++   	for(t=0; t<NUM_THREADS; t++)
++		fprintf(stderr,"%d \t \n",sum[t]);
++}
+Binary files vanilla-3.14/util/init and SAM_2015/util/init differ
+diff -ruN vanilla-3.14/util/init.c SAM_2015/util/init.c
+--- vanilla-3.14/util/init.c	1969-12-31 19:00:00.000000000 -0500
++++ SAM_2015/util/init.c	2017-12-10 21:39:32.304643016 -0500
+@@ -0,0 +1,21 @@
++#include <stdio.h>
++#include <linux/unistd.h>
++#include <sys/syscall.h>
++
++#define _SHAR_TEST_ 316 
++
++int main(int argc, char *argv[])
++{
++	long i;
++	int pid = 100;
++	printf("\nDiving to kernel level\n\n");
++
++	if (argc > 1)
++	{
++		pid = atoi(argv[1]);
++	}
++
++	i = syscall(_SHAR_TEST_ , pid, pid);
++	printf("\nRising to user level %ld\n\n",i);
++	return 0;
++}
+diff -ruN vanilla-3.14/util/Makefile SAM_2015/util/Makefile
+--- vanilla-3.14/util/Makefile	1969-12-31 19:00:00.000000000 -0500
++++ SAM_2015/util/Makefile	2017-12-10 21:39:32.303642998 -0500
+@@ -0,0 +1,4 @@
++all: init.c 
++	gcc init.c -o init
++	gcc deploy.c -o deploy
++	gcc HuBench.c -lpthread -o HuBench
+diff -ruN vanilla-3.14/util/README SAM_2015/util/README
+--- vanilla-3.14/util/README	1969-12-31 19:00:00.000000000 -0500
++++ SAM_2015/util/README	2017-12-10 21:39:32.303642998 -0500
+@@ -0,0 +1,26 @@
++init.c: Initializes SAM 
++Usage: ./init <PID>
++Example: ./init 1000
++
++PID specified with init is to restrict SAM from operating on some threads.
++SAM will not move/control tasks whose PID is less than the specified PID. 
++Value of 1000 prevents SAM from moving special purpose threads spawned 
++when Linux is launched on the machine it was developed. 
++
++A good value can be obtained by typing "ps" in the shell after Linux boots. 
++
++deploy.c: Activates SAM scheduling
++Usage: ./deploy <scheduling interval in milliseconds>
++Example: sudo ./deploy 100 
++
++100ms interval works well and is discussed in the paper
++
++HuBench.c: Microbenchmark to create coherence traffic
++Creates a 4 threaded microbenchmark to create coherence traffic. 
++There are 2 pairs of threads, each pair that communicates with its
++paired thread. Linux by default schedules them on different sockets
++creating coherence traffic. Used to determine SAM thresholds as discussed
++in the paper.
++
++For reading performance counter values without SAM suggestion tools are: 
++linux perf or perfmon.
