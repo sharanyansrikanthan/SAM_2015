@@ -3,8 +3,8 @@ at srikanth@cs.rochester.edu
 
 Paper link: https://www.cs.rochester.edu/u/srikanth/Publications/atc16_paper-srikanthan.pdf 
 
-A patch for SAM can be found in util/SAM_Patch
-Use patch on linux-3.14.8
+If patching onto existing kernel, use SAM_Patch (Linux-3.14.8)
+Download complete repo otherwise. 
 
 Linux kernel release 3.14 <http://kernel.org/>
 
