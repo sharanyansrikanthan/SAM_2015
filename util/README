@@ -24,3 +24,5 @@ in the paper.
 
 For reading performance counter values without SAM suggestion tools are: 
 linux perf or perfmon.
+
+SAM_Patch: Use on vanilla linux 3.14.8 to patch in SAM functionality
